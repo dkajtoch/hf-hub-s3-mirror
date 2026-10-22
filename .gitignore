@@ -1,0 +1,32 @@
+# Python bytecode and package metadata
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Local environments and tool caches
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build output
+build/
+dist/
+
+# Local configuration and editor files
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+
+# This library's CI installs from pyproject.toml, not a local uv lockfile.
+/uv.lock

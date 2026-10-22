@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hf-hub-s3-mirror"
+version = "0.1.0"
+description = "S3-backed access to mirrored Hugging Face Hub repositories"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = "Apache-2.0"
+authors = [{ name = "Dariusz Kajtoch" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "boto3==1.41.5",
+  "filelock==3.29.7",
+  "fsspec==2024.9.0",
+  "huggingface-hub==0.36.2",
+  "requests>=2.32,<3",
+]
+
+[project.optional-dependencies]
+datasets = ["datasets==5.0.1"]
+transformers = ["transformers==4.57.6"]
+test = ["pytest>=8,<10", "datasets==5.0.1", "transformers==4.57.6"]
+
+[project.scripts]
+hf-hub-s3-publish = "hf_hub_s3_mirror.publish:main"
+
+[project.urls]
+Repository = "https://github.com/dkajtoch/hf-hub-s3-mirror"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hf_hub_s3_mirror"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src", "tests", "README.md", "LICENSE", "pyproject.toml", ".pre-commit-config.yaml"]
+
+[tool.mypy]
+python_version = "3.12"
+disable_error_code = ["import-untyped"]

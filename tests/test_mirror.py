@@ -17,6 +17,10 @@ class FakeRepository:
         self.download_payload = payload
         self.commit = commit
         self.download_count = 0
+        self.mirrored_repo_ids = {"example/model"}
+
+    def has_repository(self, repo_type: str, repo_id: str) -> bool:
+        return repo_id in self.mirrored_repo_ids
 
     def resolve(self, repo_type: str, repo_id: str, revision: str) -> str:
         return self.commit
@@ -105,6 +109,112 @@ def test_hub_download_rejects_corrupt_blob(
 
     # Then
     assert expected_error in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("allow_hub_fallback", "repo_id", "expected_source"),
+    [
+        (True, "example/model", "mirror"),
+        (True, "other/model", "hub"),
+        (True, "legacy-id", "hub"),
+        (False, "other/model", "mirror"),
+    ],
+)
+def test_hub_download_falls_back_only_for_repositories_absent_from_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    allow_hub_fallback: bool,
+    repo_id: str,
+    expected_source: str,
+) -> None:
+    # Given
+    payload = b"a mirrored configuration"
+    repository = FakeRepository(payload, "a" * 40)
+    hub_calls: list[tuple[str, str]] = []
+
+    def hub_download(repo_id: str, filename: str, **kwargs: object) -> str:
+        hub_calls.append((repo_id, filename))
+        return "hub-path"
+
+    monkeypatch.setattr(mirror, "_BACKEND", repository)
+    monkeypatch.setattr(mirror, "_HUB_FALLBACK", allow_hub_fallback)
+    monkeypatch.setitem(mirror._UPSTREAM, "hf_hub_download", hub_download)
+
+    # When
+    path = mirror.hf_hub_download(
+        repo_id, "config.json", revision="main", cache_dir=tmp_path
+    )
+
+    # Then
+    source = "hub" if hub_calls else "mirror"
+    assert source == expected_source
+    if source == "mirror":
+        assert Path(path).read_bytes() == payload
+
+
+def test_api_routes_repositories_absent_from_mirror_to_hub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given
+    repository = FakeRepository(b"", "a" * 40)
+
+    class HubApi:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.token = kwargs.get("token")
+
+        def dataset_info(self, repo_id: str, **kwargs: object) -> str:
+            return f"hub:{repo_id}:{self.token}"
+
+        def whoami(self) -> str:
+            return "hub-user"
+
+    monkeypatch.setattr(mirror, "_BACKEND", repository)
+    monkeypatch.setattr(mirror, "_HUB_FALLBACK", True)
+    monkeypatch.setitem(mirror._UPSTREAM, "HfApi", HubApi)
+    api = mirror.S3HfApi(token="secret")
+
+    # When
+    info = api.dataset_info("other/data", revision="main")
+    user = api.whoami()
+
+    # Then
+    assert info == "hub:other/data:secret"
+    assert user == "hub-user"
+
+
+def test_install_with_fallback_keeps_the_hub_endpoint_in_fresh_process() -> None:
+    # Given
+    script = """
+import os
+from unittest.mock import patch
+import hf_hub_s3_mirror
+from hf_hub_s3_mirror import mirror
+with patch('boto3.client', return_value=object()):
+    hf_hub_s3_mirror.install(bucket='example-bucket')
+print(mirror._HUB_FALLBACK, os.environ.get('HF_ENDPOINT'))
+"""
+    expected_output = "True None"
+    environment = {
+        key: value for key, value in os.environ.items() if key != "HF_ENDPOINT"
+    }
+    environment.update(
+        PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"),
+        HF_S3_MIRROR_ENABLED="0",
+        HF_S3_MIRROR_ALLOW_HUB_FALLBACK="1",
+    )
+
+    # When
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+
+    # Then
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected_output
 
 
 def test_snapshot_download_uses_cached_snapshot_when_local_files_only(

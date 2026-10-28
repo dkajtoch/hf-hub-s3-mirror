@@ -70,11 +70,19 @@ package at process startup with `HF_S3_MIRROR_ENABLED=1` and set
 `HF_S3_MIRROR_BUCKET` (and optionally `HF_S3_MIRROR_PREFIX`) first. Importing
 the package alone does not activate the mirror unless that flag is set.
 
-Installation deliberately disables public-Hub fallback: an absent mirrored
+By default installation disables public-Hub fallback: an absent mirrored
 repository, revision, or file fails instead of fetching it from the internet.
-Do not enable it process-wide in an evaluator unless every Hub asset that
-process needs is mirrored. The runtime needs S3 `GetObject` and `ListBucket`
-access; publishing also needs `PutObject`. The package never embeds AWS
+
+To mirror only some repositories, set `HF_S3_MIRROR_ALLOW_HUB_FALLBACK=1` or
+call `install(..., allow_hub_fallback=True)`. Repositories present in the
+mirror are then read only from S3, and every other repository goes to the Hub
+unchanged (including `HF_ENDPOINT`, tokens, and Xet). The mirror stays
+authoritative for the repositories it holds: a missing revision or file there
+still fails rather than reaching the Hub, so a gated repository is never
+requested upstream once it is mirrored.
+
+The runtime needs S3 `GetObject` and `ListBucket` access; publishing also
+needs `PutObject`. The package never embeds AWS
 credentials or dataset bytes.
 
 ## Mirror layout

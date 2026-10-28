@@ -4,24 +4,35 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
+from typing import Any
 from urllib.parse import quote, unquote
 
 import boto3
 from botocore.exceptions import ClientError
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.hf_api import BlobLfsInfo
 from huggingface_hub.utils import filter_repo_objects
 
+from hf_hub_s3_mirror._artifacts import (
+    FileEntry,
+    RepoType,
+    _DEFAULT_MIRROR_PREFIX,
+    _REPO_DIRECTORIES,
+    _is_commit,
+    _sha256_file,
+    _sha256_stream,
+    _validate_repo_path,
+    _validate_repo_type,
+)
 
-DEFAULT_PREFIX = "hf_hub"
-_COMMIT_LENGTH = 40
-_HASH_CHUNK_SIZE = 8 * 1024 * 1024
-_REPOSITORY_DIRECTORIES = {"model": "models", "dataset": "datasets"}
+
+DEFAULT_PREFIX = _DEFAULT_MIRROR_PREFIX
 _KIND_REPO_TYPES = {"model": "model", "tokenizer": "model", "dataset": "dataset"}
 # Everything AutoTokenizer and AutoConfig read, including remote-code modules.
 TOKENIZER_PATTERNS = (
@@ -32,6 +43,7 @@ TOKENIZER_PATTERNS = (
     "added_tokens.json",
     "chat_template.jinja",
     "chat_template.json",
+    "additional_chat_templates/*.jinja",
     "vocab.json",
     "vocab.txt",
     "merges.txt",
@@ -39,22 +51,6 @@ TOKENIZER_PATTERNS = (
     "*.tiktoken",
     "*.py",
 )
-
-
-def _is_commit(value: str) -> bool:
-    return len(value) == _COMMIT_LENGTH and all(
-        character in "0123456789abcdef" for character in value
-    )
-
-
-def _sha256_file(path: Path) -> tuple[str, int]:
-    digest = hashlib.sha256()
-    size = 0
-    with path.open("rb") as source:
-        while chunk := source.read(_HASH_CHUNK_SIZE):
-            digest.update(chunk)
-            size += len(chunk)
-    return digest.hexdigest(), size
 
 
 def _s3_key(*parts: str) -> str:
@@ -92,10 +88,10 @@ def parse_hf_path(
 
 
 def validate_repo_file(path: str) -> None:
-    if not path or path.startswith("/") or "\\" in path:
-        raise ValueError(f"Invalid repository file path: {path!r}")
-    if any(part in {"", ".", ".."} for part in PurePosixPath(path).parts):
-        raise ValueError(f"Invalid repository file path: {path!r}")
+    try:
+        _validate_repo_path(path)
+    except ValueError as error:
+        raise ValueError(f"Invalid repository file path: {path!r}") from error
 
 
 def json_bytes(value: dict) -> bytes:
@@ -128,6 +124,12 @@ def upload_blob(
         if existing_digest not in {None, digest}:
             raise RuntimeError(
                 f"Existing immutable blob has an unexpected hash: s3://{bucket}/{key}"
+            )
+        # Size and metadata are writer-controlled; only the bytes prove the key.
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"]
+        if _sha256_stream(body) != (digest, size):
+            raise RuntimeError(
+                f"Existing immutable blob has unexpected content: s3://{bucket}/{key}"
             )
         return False
 
@@ -200,7 +202,17 @@ def select_files(
     )
 
 
-def publish(args: argparse.Namespace) -> dict:
+@dataclass(frozen=True)
+class _SourceRevision:
+    repo_id: str
+    repo_type: RepoType
+    revision: str
+    commit: str
+    api: HfApi
+    upstream_lfs: dict[str, BlobLfsInfo | None]
+
+
+def _resolve_source(args: argparse.Namespace) -> _SourceRevision:
     expected_type = _KIND_REPO_TYPES[args.kind]
     path = args.hf_path.removeprefix("hf://")
     if (path.startswith("datasets/") and expected_type != "dataset") or (
@@ -210,7 +222,6 @@ def publish(args: argparse.Namespace) -> dict:
     repo_id, repo_type, revision = parse_hf_path(
         args.hf_path, expected_type, args.revision
     )
-    publish_ref = None if _is_commit(revision) else revision
     api = HfApi(token=args.token)
     info = api.repo_info(
         repo_id, repo_type=repo_type, revision=revision, files_metadata=True
@@ -220,37 +231,52 @@ def publish(args: argparse.Namespace) -> dict:
         raise RuntimeError(
             f"Upstream revision did not resolve to a 40-character commit: {commit!r}"
         )
+    upstream_lfs = {
+        sibling.rfilename: sibling.lfs
+        for sibling in getattr(info, "siblings", None) or []
+    }
 
-    s3 = None if args.dry_run else boto3.client("s3", region_name=args.region)
-    prefix = args.prefix.strip("/")
-    repository_root = _s3_key(
-        prefix, "repos", _REPOSITORY_DIRECTORIES[repo_type], repo_id
+    return _SourceRevision(
+        repo_id, _validate_repo_type(repo_type), revision, commit, api, upstream_lfs
     )
-    blob_root = _s3_key(prefix, "blobs", "sha256")
-    files: dict[str, dict] = {}
-    uploaded_blobs = 0
 
+
+def _publish_files(
+    args: argparse.Namespace, source: _SourceRevision, s3: Any
+) -> tuple[dict[str, FileEntry], int]:
+    blob_root = _s3_key(args.prefix.strip("/"), "blobs", "sha256")
+    files: dict[str, FileEntry] = {}
+    uploaded_blobs = 0
     repo_files = select_files(
-        api.list_repo_files(repo_id, repo_type=repo_type, revision=commit),
+        source.api.list_repo_files(
+            source.repo_id, repo_type=source.repo_type, revision=source.commit
+        ),
         args.kind,
         args.allow_patterns,
         args.ignore_patterns,
     )
     if not repo_files:
-        raise ValueError(f"No files in {repo_id}@{commit} match the requested patterns")
+        raise ValueError(
+            f"No files in {source.repo_id}@{source.commit} match the requested patterns"
+        )
     for index, filename in enumerate(repo_files, start=1):
         validate_repo_file(filename)
         local_path = Path(
             hf_hub_download(
-                repo_id,
+                source.repo_id,
                 filename,
-                repo_type=repo_type,
-                revision=commit,
+                repo_type=source.repo_type,
+                revision=source.commit,
                 token=args.token,
                 cache_dir=args.cache_dir,
             )
         )
         sha256, size = _sha256_file(local_path)
+        lfs = source.upstream_lfs.get(filename)
+        if lfs is not None and (sha256, size) != (lfs.sha256, lfs.size):
+            raise RuntimeError(
+                f"Downloaded {filename!r} does not match its upstream LFS metadata"
+            )
         blob_key = f"{blob_root}/{sha256[:2]}/{sha256}"
         if not args.dry_run:
             assert s3 is not None
@@ -259,6 +285,19 @@ def publish(args: argparse.Namespace) -> dict:
             )
         files[filename] = {"blob_sha256": sha256, "size": size}
         print(f"[{index}/{len(repo_files)}] {filename} -> {sha256}", file=sys.stderr)
+
+    return files, uploaded_blobs
+
+
+def publish(args: argparse.Namespace) -> dict:
+    source = _resolve_source(args)
+    repo_id, repo_type = source.repo_id, source.repo_type
+    revision, commit = source.revision, source.commit
+    publish_ref = None if _is_commit(revision) else revision
+    s3 = None if args.dry_run else boto3.client("s3", region_name=args.region)
+    prefix = args.prefix.strip("/")
+    repository_root = _s3_key(prefix, "repos", _REPO_DIRECTORIES[repo_type], repo_id)
+    files, uploaded_blobs = _publish_files(args, source, s3)
 
     manifest: dict = {
         "schema_version": 1,

@@ -17,17 +17,17 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-  "boto3==1.41.5",
-  "filelock==3.29.7",
-  "fsspec==2024.9.0",
-  "huggingface-hub==0.36.2",
-  "requests>=2.32,<3",
+  "boto3>=1.41.5,<2",
+  "filelock>=4.2.1,<5",
+  "fsspec>=2026.6.0",
+  "huggingface-hub==1.33.0",
+  "httpx>=0.28.1,<1",
 ]
 
 [project.optional-dependencies]
 datasets = ["datasets==5.0.1"]
-transformers = ["transformers==4.57.6"]
-test = ["pytest>=8,<10", "datasets==5.0.1", "transformers==4.57.6"]
+transformers = ["transformers==5.12.1"]
+test = ["pytest>=8,<10", "datasets==5.0.1", "transformers==5.12.1"]
 
 [project.scripts]
 hf-hub-s3-publish = "hf_hub_s3_mirror.publish:main"

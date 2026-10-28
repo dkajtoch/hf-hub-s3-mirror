@@ -10,12 +10,13 @@ permissions:
 
 jobs:
   test:
-    name: Python ${{ matrix.python-version }}
+    name: Python ${{ matrix.python-version }} / ${{ matrix.dependencies }} dependencies
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+        dependencies: [minimum, latest]
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -25,8 +26,21 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install package and test tools
-        run: python -m pip install '.[test]' 'ruff==0.11.10' 'mypy==2.2.0'
+      - name: Install package with minimum runtime dependencies
+        if: matrix.dependencies == 'minimum'
+        run: >-
+          python -m pip install '.[test]' 'ruff==0.11.10' 'mypy==2.2.0'
+          'boto3==1.41.5' 'filelock==4.2.1' 'fsspec==2026.6.0'
+          'huggingface-hub==1.33.0' 'httpx==0.28.1'
+
+      - name: Install package with latest compatible dependencies
+        if: matrix.dependencies == 'latest'
+        run: python -m pip install --upgrade --upgrade-strategy eager '.[test]' 'ruff==0.11.10' 'mypy==2.2.0'
+
+      - name: Check and report resolved dependencies
+        run: |
+          python -m pip check
+          python -m pip freeze
 
       - name: Lint and format
         run: |
@@ -37,7 +51,7 @@ jobs:
         run: mypy src/hf_hub_s3_mirror
 
       - name: Pre-commit hooks
-        if: matrix.python-version == '3.12'
+        if: matrix.python-version == '3.12' && matrix.dependencies == 'latest'
         run: |
           python -m pip install 'pre-commit==4.7.0'
           pre-commit run --all-files

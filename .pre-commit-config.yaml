@@ -28,9 +28,9 @@ repos:
         additional_dependencies:
           - mypy==2.2.0
           - boto3==1.41.5
-          - filelock==3.29.7
-          - fsspec==2024.9.0
-          - huggingface-hub==0.36.2
-          - requests>=2.32,<3
+          - filelock==4.2.1
+          - fsspec==2026.6.0
+          - huggingface-hub==1.33.0
+          - httpx>=0.28.1,<1
         pass_filenames: false
         types_or: [python, pyi]

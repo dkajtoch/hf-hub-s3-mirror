@@ -5,8 +5,8 @@ It publishes immutable, SHA-256-addressed blobs and a manifest for each pinned
 Hub commit, then exposes those files through the familiar `huggingface_hub` API.
 Downloads are verified and cached using the normal Hugging Face cache layout.
 
-This is an early compatibility layer for `huggingface_hub==0.36.2`,
-`datasets==5.0.1`, and `transformers==4.57.6`. It patches their Hub-facing
+This is an early compatibility layer for `huggingface_hub==1.33.0`,
+`datasets==5.0.1`, and `transformers==5.12.1`. It patches their Hub-facing
 interfaces **for the whole Python process**. It is not a drop-in replacement
 for arbitrary versions or a general S3 filesystem.
 
@@ -22,6 +22,12 @@ The optional `datasets` and `transformers` extras install the tested versions:
 ```bash
 pip install 'hf-hub-s3-mirror[datasets,transformers]'
 ```
+
+The core dependencies use compatible version ranges, except for Hugging Face Hub:
+its version stays pinned because the adapter patches internal interfaces. The
+optional integrations also stay pinned to tested versions. In particular,
+`datasets==5.0.1` requires `fsspec<=2026.6.0`, so installing the `datasets` extra
+selects `fsspec==2026.6.0` even though the core package allows newer versions.
 
 ## Publish a pinned Hub revision
 
@@ -73,14 +79,23 @@ the process knows, for example, its AWS region.
 
 By default installation disables public-Hub fallback: an absent mirrored
 repository, revision, or file fails instead of fetching it from the internet.
+It also sets `HF_ENDPOINT=https://hf-mirror.invalid` and
+`HF_HUB_DISABLE_IMPLICIT_TOKEN=1` for the process and its child processes, so a
+Hub request that escapes the mirror fails without sending the implicit token.
+`datasets` still reads full `https://huggingface.co/datasets/.../resolve/...`
+URLs from the mirror and skips its download-count request.
 
 To mirror only some repositories, set `HF_S3_MIRROR_ALLOW_HUB_FALLBACK=1` or
 call `install(..., allow_hub_fallback=True)`. Repositories present in the
-mirror are then read only from S3, and every other repository goes to the Hub
-unchanged (including `HF_ENDPOINT`, tokens, and Xet). The mirror stays
+mirror are then read only from S3. Supported operations on other repositories
+use the Hub (including `HF_ENDPOINT`, tokens, and Xet). The mirror stays
 authoritative for the repositories it holds: a missing revision or file there
 still fails rather than reaching the Hub, so a gated repository is never
 requested upstream once it is mirrored.
+
+Unsupported operations on mirrored repositories fail closed, including writes
+and public-Hub URL generation. Account-only helpers such as `whoami` remain
+available when fallback is enabled.
 
 The runtime needs S3 `GetObject` and `ListBucket` access; publishing also
 needs `PutObject`. The package never embeds AWS
@@ -94,11 +109,37 @@ mutable revision refs under `.../refs/`, and shared immutable blobs under
 `<prefix>/blobs/sha256/`. The reader verifies blob sizes and SHA-256 hashes
 before placing them in the local Hugging Face cache.
 
+`HfFileSystem` also verifies a complete file before returning any of its bytes.
+The first read downloads the whole file, even for a small requested range, and
+requires enough local cache space for it. Subsequent opens revalidate and reuse
+the cached blob; seek and partial reads operate on the verified local file.
+
 ## Development
+
+The implementation separates artifact validation, S3 access, verified caching,
+filesystem compatibility, and lazy datasets integration. The public downloads,
+Hub API adapter, and installation entry point remain in `mirror.py`.
+
+Tests are grouped by contract in four modules: `test_storage.py`, `test_api.py`,
+`test_filesystem.py`, and `test_integration.py`. Shared fixtures live in
+`conftest.py` and `_support.py`. The integration tests publish fixture repositories
+and read their output through the real datasets and tokenizer libraries with
+network access blocked; they do not replace a smoke test against your S3 bucket.
 
 The pre-commit hooks check whitespace, YAML/TOML, merge markers, file size,
 Ruff linting and formatting, and mypy. They use Python 3.12 for their isolated
-environments; CI also runs the tests on Python 3.11 and 3.12.
+environments. CI runs the full suite on Python 3.11 and 3.12 with both the minimum
+direct runtime dependencies and the latest versions allowed by the package and
+its test extras. Each job checks dependency consistency and logs the resolved
+versions. The mypy hook keeps its own tested dependency pins.
+
+The minimum runtime versions are pinned directly in the CI install step. Keep
+those pins aligned with the lower bounds in `pyproject.toml`. For local development:
+
+```bash
+python -m pip install -e '.[test]'
+python -m pytest tests -q
+```
 
 ```bash
 uv tool install pre-commit==4.7.0

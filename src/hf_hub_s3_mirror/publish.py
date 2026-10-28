@@ -15,12 +15,30 @@ from urllib.parse import quote, unquote
 import boto3
 from botocore.exceptions import ClientError
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.utils import filter_repo_objects
 
 
 DEFAULT_PREFIX = "hf_hub"
 _COMMIT_LENGTH = 40
 _HASH_CHUNK_SIZE = 8 * 1024 * 1024
 _REPOSITORY_DIRECTORIES = {"model": "models", "dataset": "datasets"}
+_KIND_REPO_TYPES = {"model": "model", "tokenizer": "model", "dataset": "dataset"}
+# Everything AutoTokenizer and AutoConfig read, including remote-code modules.
+TOKENIZER_PATTERNS = (
+    "config.json",
+    "tokenizer_config.json",
+    "tokenizer.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "chat_template.jinja",
+    "chat_template.json",
+    "vocab.json",
+    "vocab.txt",
+    "merges.txt",
+    "*.model",
+    "*.tiktoken",
+    "*.py",
+)
 
 
 def _is_commit(value: str) -> bool:
@@ -127,21 +145,59 @@ def upload_blob(
     return True
 
 
-def put_immutable_manifest(s3, bucket: str, key: str, body: bytes) -> None:
-    existing = object_exists(s3, bucket, key)
-    if existing is not None:
-        current = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
-        if current != body:
+def merge_manifest_files(
+    current: dict[str, dict], new: dict[str, dict], location: str
+) -> dict[str, dict]:
+    """Union two file sets of one commit; a shared path must keep its blob."""
+    for filename, entry in new.items():
+        if filename in current and current[filename] != entry:
             raise RuntimeError(
-                f"Refusing to overwrite immutable manifest: s3://{bucket}/{key}"
+                f"Refusing to change {filename!r} in immutable manifest: {location}"
             )
-        return
+    return {**current, **new}
+
+
+def put_manifest(s3, bucket: str, key: str, manifest: dict) -> dict:
+    """Write a commit manifest, extending any files published for it earlier."""
+    if object_exists(s3, bucket, key) is not None:
+        current = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+        identity = ("schema_version", "repo_type", "repo_id", "commit")
+        if any(current.get(field) != manifest[field] for field in identity):
+            raise RuntimeError(
+                f"Existing manifest has a different identity: s3://{bucket}/{key}"
+            )
+        files = merge_manifest_files(
+            current["files"], manifest["files"], f"s3://{bucket}/{key}"
+        )
+        if files == current["files"]:
+            return current
+        manifest = {**manifest, "files": files}
+    body = json_bytes(manifest)
     s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
     current = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
     if current != body:
         raise RuntimeError(
             f"Uploaded manifest failed verification: s3://{bucket}/{key}"
         )
+    return manifest
+
+
+def select_files(
+    repo_files: list[str],
+    kind: str,
+    allow_patterns: list[str] | None,
+    ignore_patterns: list[str] | None,
+) -> list[str]:
+    allow = list(allow_patterns or [])
+    if kind == "tokenizer":
+        allow = [*TOKENIZER_PATTERNS, *allow]
+    return list(
+        filter_repo_objects(
+            repo_files,
+            allow_patterns=allow or None,
+            ignore_patterns=ignore_patterns or None,
+        )
+    )
 
 
 def publish(args: argparse.Namespace) -> dict:
@@ -150,11 +206,15 @@ def publish(args: argparse.Namespace) -> dict:
             "Disable HF_S3_MIRROR_ENABLED when publishing from the upstream Hugging Face Hub"
         )
 
+    expected_type = _KIND_REPO_TYPES[args.kind]
+    path = args.hf_path.removeprefix("hf://")
+    if (path.startswith("datasets/") and expected_type != "dataset") or (
+        path.startswith("models/") and expected_type != "model"
+    ):
+        raise ValueError(f"{args.hf_path!r} is not a {expected_type} repository")
     repo_id, repo_type, revision = parse_hf_path(
-        args.hf_path, args.repo_type, args.revision
+        args.hf_path, expected_type, args.revision
     )
-    if repo_type not in {"model", "dataset"}:
-        raise ValueError(f"Unsupported repository type: {repo_type!r}")
     publish_ref = None if _is_commit(revision) else revision
     api = HfApi(token=args.token)
     info = api.repo_info(
@@ -175,7 +235,14 @@ def publish(args: argparse.Namespace) -> dict:
     files: dict[str, dict] = {}
     uploaded_blobs = 0
 
-    repo_files = api.list_repo_files(repo_id, repo_type=repo_type, revision=commit)
+    repo_files = select_files(
+        api.list_repo_files(repo_id, repo_type=repo_type, revision=commit),
+        args.kind,
+        args.allow_patterns,
+        args.ignore_patterns,
+    )
+    if not repo_files:
+        raise ValueError(f"No files in {repo_id}@{commit} match the requested patterns")
     for index, filename in enumerate(repo_files, start=1):
         validate_repo_file(filename)
         local_path = Path(
@@ -198,7 +265,7 @@ def publish(args: argparse.Namespace) -> dict:
         files[filename] = {"blob_sha256": sha256, "size": size}
         print(f"[{index}/{len(repo_files)}] {filename} -> {sha256}", file=sys.stderr)
 
-    manifest = {
+    manifest: dict = {
         "schema_version": 1,
         "repo_type": repo_type,
         "repo_id": repo_id,
@@ -212,9 +279,11 @@ def publish(args: argparse.Namespace) -> dict:
         else None
     )
 
+    manifest_file_count = len(files)
     if not args.dry_run:
         assert s3 is not None
-        put_immutable_manifest(s3, args.bucket, manifest_key, json_bytes(manifest))
+        manifest = put_manifest(s3, args.bucket, manifest_key, manifest)
+        manifest_file_count = len(manifest["files"])
         if publish_ref:
             # Mutable ref is deliberately written last.
             ref = {
@@ -240,7 +309,9 @@ def publish(args: argparse.Namespace) -> dict:
         "source_revision": revision,
         "commit": commit,
         "published_ref": publish_ref,
+        "kind": args.kind,
         "file_count": len(files),
+        "manifest_file_count": manifest_file_count,
         "uploaded_blob_count": uploaded_blobs,
         "manifest": f"s3://{args.bucket}/{manifest_key}",
         "ref": f"s3://{args.bucket}/{ref_key}" if ref_key else None,
@@ -249,27 +320,42 @@ def publish(args: argparse.Namespace) -> dict:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "hf_path", help="org/name, hf://org/name, or hf://datasets/org/name"
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "hf_path",
+        help="org/name or hf://org/name; datasets also accept hf://datasets/org/name",
     )
-    parser.add_argument(
-        "--repo-type",
-        choices=["model", "dataset"],
-        help="inferred from hf://datasets/ when omitted",
-    )
-    parser.add_argument(
+    common.add_argument(
         "--revision",
         help="upstream branch, tag, or commit; required unless encoded in the HF path",
     )
-    parser.add_argument("--bucket", required=True)
-    parser.add_argument("--prefix", default=DEFAULT_PREFIX)
-    parser.add_argument("--region", help="S3 region; defaults to the AWS configuration")
-    parser.add_argument("--cache-dir", type=Path)
-    parser.add_argument("--token", default=os.environ.get("HF_TOKEN"))
-    parser.add_argument(
+    common.add_argument(
+        "--allow-patterns",
+        nargs="+",
+        metavar="GLOB",
+        help="publish only matching files (tokenizer adds these to its defaults)",
+    )
+    common.add_argument(
+        "--ignore-patterns", nargs="+", metavar="GLOB", help="skip matching files"
+    )
+    common.add_argument("--bucket", required=True)
+    common.add_argument("--prefix", default=DEFAULT_PREFIX)
+    common.add_argument("--region", help="S3 region; defaults to the AWS configuration")
+    common.add_argument("--cache-dir", type=Path)
+    common.add_argument("--token", default=os.environ.get("HF_TOKEN"))
+    common.add_argument(
         "--dry-run", action="store_true", help="download and hash without writing S3"
     )
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    kinds = parser.add_subparsers(dest="kind", required=True)
+    kinds.add_parser("model", parents=[common], help="publish a model repository")
+    kinds.add_parser(
+        "tokenizer",
+        parents=[common],
+        help="publish only a model's tokenizer, config, and remote-code files",
+    )
+    kinds.add_parser("dataset", parents=[common], help="publish a dataset repository")
     return parser.parse_args(argv)
 
 

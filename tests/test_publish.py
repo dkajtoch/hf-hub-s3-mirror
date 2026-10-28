@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import hashlib
 import io
 import json
@@ -11,6 +10,8 @@ import pytest
 from botocore.exceptions import ClientError
 
 from hf_hub_s3_mirror import publish
+
+COMMIT = "a" * 40
 
 
 class FakeS3:
@@ -46,6 +47,46 @@ class FakeS3:
         self.metadata[key] = ExtraArgs["Metadata"]
 
 
+@pytest.fixture
+def fake_hub(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Serve `files` as one upstream commit and publish into a fake bucket."""
+    s3 = FakeS3()
+    files: dict[str, bytes] = {}
+
+    class FakeHfApi:
+        def __init__(self, token: str | None) -> None:
+            pass
+
+        def repo_info(self, *args: object, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(sha=COMMIT)
+
+        def list_repo_files(self, *args: object, **kwargs: object) -> list[str]:
+            return list(files)
+
+    def download(repo_id: str, filename: str, **kwargs: object) -> str:
+        path = tmp_path / "hub" / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(files[filename])
+        return str(path)
+
+    monkeypatch.setattr(publish, "HfApi", FakeHfApi)
+    monkeypatch.setattr(publish, "hf_hub_download", download)
+    monkeypatch.setattr(publish.boto3, "client", lambda *args, **kwargs: s3)
+    monkeypatch.delenv("HF_S3_MIRROR_ENABLED", raising=False)
+
+    def run(*argv: str) -> dict:
+        return publish.publish(
+            publish.parse_args([*argv, "--bucket", "example-bucket"])
+        )
+
+    return SimpleNamespace(s3=s3, files=files, run=run)
+
+
+def _manifest(s3: FakeS3, repo_dir: str) -> dict:
+    key = f"hf_hub/repos/{repo_dir}/snapshots/{COMMIT}/manifest.json"
+    return json.loads(s3.objects[key])
+
+
 def test_publisher_requires_an_explicit_revision() -> None:
     # Given
     path = "hf://datasets/example/data"
@@ -59,59 +100,99 @@ def test_publisher_requires_an_explicit_revision() -> None:
     assert expected_error in str(raised.value)
 
 
-def test_publisher_writes_immutable_manifest_and_ref(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_publisher_writes_immutable_manifest_and_ref(fake_hub) -> None:
     # Given
-    commit = "a" * 40
     payload = b"mirrored data"
     digest = hashlib.sha256(payload).hexdigest()
-    source_file = tmp_path / "data.parquet"
-    source_file.write_bytes(payload)
-    s3 = FakeS3()
-    args = argparse.Namespace(
-        hf_path="hf://datasets/example/data@main",
-        repo_type=None,
-        revision=None,
-        bucket="example-bucket",
-        prefix="hf_hub",
-        region="us-east-1",
-        cache_dir=None,
-        token=None,
-        dry_run=False,
-    )
-    expected_manifest_key = (
-        f"hf_hub/repos/datasets/example/data/snapshots/{commit}/manifest.json"
-    )
+    fake_hub.files["data.parquet"] = payload
     expected_ref_key = "hf_hub/repos/datasets/example/data/refs/main.json"
     expected_blob_key = f"hf_hub/blobs/sha256/{digest[:2]}/{digest}"
 
-    class FakeHfApi:
-        def __init__(self, token: str | None) -> None:
-            pass
-
-        def repo_info(self, *args: object, **kwargs: object) -> SimpleNamespace:
-            return SimpleNamespace(sha=commit)
-
-        def list_repo_files(self, *args: object, **kwargs: object) -> list[str]:
-            return ["data.parquet"]
-
-    monkeypatch.setattr(publish, "HfApi", FakeHfApi)
-    monkeypatch.setattr(
-        publish, "hf_hub_download", lambda *args, **kwargs: str(source_file)
-    )
-    monkeypatch.setattr(publish.boto3, "client", lambda *args, **kwargs: s3)
-    monkeypatch.delenv("HF_S3_MIRROR_ENABLED", raising=False)
-
     # When
-    receipt = publish.publish(args)
+    receipt = fake_hub.run("dataset", "hf://datasets/example/data@main")
 
     # Then
-    manifest = json.loads(s3.objects[expected_manifest_key])
-    ref = json.loads(s3.objects[expected_ref_key])
-    assert s3.objects[expected_blob_key] == payload
+    manifest = _manifest(fake_hub.s3, "datasets/example/data")
+    ref = json.loads(fake_hub.s3.objects[expected_ref_key])
+    assert fake_hub.s3.objects[expected_blob_key] == payload
     assert manifest["files"] == {
         "data.parquet": {"blob_sha256": digest, "size": len(payload)}
     }
-    assert ref["commit"] == commit
+    assert ref["commit"] == COMMIT
     assert receipt["uploaded_blob_count"] == 1
+
+
+def test_tokenizer_publishes_only_tokenizer_config_and_code_files(fake_hub) -> None:
+    # Given
+    fake_hub.files.update(
+        {
+            "config.json": b"{}",
+            "tokenizer.json": b"{}",
+            "tokenizer_config.json": b"{}",
+            "tokenization_custom.py": b"pass",
+            "model-00001-of-00002.safetensors": b"weights",
+            "model.safetensors.index.json": b"{}",
+            "README.md": b"card",
+        }
+    )
+    expected_files = {
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "tokenization_custom.py",
+    }
+
+    # When
+    fake_hub.run("tokenizer", f"example/model@{COMMIT}")
+
+    # Then
+    assert set(_manifest(fake_hub.s3, "models/example/model")["files"]) == (
+        expected_files
+    )
+
+
+def test_later_publish_extends_the_commit_manifest(fake_hub) -> None:
+    # Given
+    fake_hub.files.update(
+        {"config.json": b"{}", "model.safetensors": b"weights", "README.md": b"card"}
+    )
+    fake_hub.run("tokenizer", f"example/model@{COMMIT}")
+
+    # When
+    receipt = fake_hub.run(
+        "model", f"example/model@{COMMIT}", "--ignore-patterns", "README.md"
+    )
+
+    # Then
+    manifest = _manifest(fake_hub.s3, "models/example/model")
+    assert set(manifest["files"]) == {"config.json", "model.safetensors"}
+    assert receipt["file_count"] == 2
+    assert receipt["manifest_file_count"] == 2
+
+
+def test_publish_refuses_to_change_a_published_file(fake_hub) -> None:
+    # Given
+    fake_hub.files["config.json"] = b"{}"
+    fake_hub.run("tokenizer", f"example/model@{COMMIT}")
+    fake_hub.files["config.json"] = b'{"changed": true}'
+    expected_error = "Refusing to change 'config.json'"
+
+    # When
+    with pytest.raises(RuntimeError) as raised:
+        fake_hub.run("model", f"example/model@{COMMIT}")
+
+    # Then
+    assert expected_error in str(raised.value)
+
+
+def test_publish_rejects_a_dataset_path_for_a_tokenizer(fake_hub) -> None:
+    # Given
+    path = f"hf://datasets/example/data@{COMMIT}"
+    expected_error = "is not a model repository"
+
+    # When
+    with pytest.raises(ValueError) as raised:
+        fake_hub.run("tokenizer", path)
+
+    # Then
+    assert expected_error in str(raised.value)

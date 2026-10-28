@@ -26,9 +26,19 @@ pip install 'hf-hub-s3-mirror[datasets,transformers]'
 ## Publish a pinned Hub revision
 
 ```bash
-hf-hub-s3-publish 'hf://datasets/ORG/NAME@REVISION' \
-  --bucket YOUR_BUCKET --prefix hf_hub
+hf-hub-s3-publish dataset 'ORG/NAME@REVISION' --bucket YOUR_BUCKET
+hf-hub-s3-publish model 'ORG/NAME@REVISION' --bucket YOUR_BUCKET
+hf-hub-s3-publish tokenizer 'ORG/NAME@REVISION' --bucket YOUR_BUCKET
 ```
+
+`tokenizer` publishes only the files `AutoTokenizer` and `AutoConfig` read
+from a model repository (tokenizer and config JSON, vocabularies, chat
+templates, and remote-code `*.py` modules), not the weights. Every kind
+accepts `--allow-patterns` and `--ignore-patterns` with the same glob
+semantics as `snapshot_download`; for `tokenizer`, allow patterns add to its
+defaults. Publishing more files of an already published commit extends its
+manifest; a file that is already published must keep the same blob. Readers
+fail closed on any file the manifest does not list.
 
 `REVISION` may be a branch, tag, or full commit; the publisher resolves it to
 an immutable commit and stores the commit in the manifest. You may pass

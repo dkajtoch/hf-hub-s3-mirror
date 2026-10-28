@@ -379,6 +379,41 @@ def test_import_is_inert_until_explicit_install() -> None:
     assert result.stdout.strip() == expected_output
 
 
+def test_install_resolves_a_callable_bucket_on_first_access_in_fresh_process() -> None:
+    # Given
+    script = """
+from unittest.mock import patch
+import hf_hub_s3_mirror
+from hf_hub_s3_mirror import mirror
+calls = []
+def bucket():
+    calls.append(1)
+    return 'example-bucket'
+with patch('boto3.client', return_value=object()):
+    hf_hub_s3_mirror.install(bucket=bucket, allow_hub_fallback=True)
+before = len(calls)
+print(before, mirror._BACKEND.bucket, mirror._BACKEND.bucket, len(calls))
+"""
+    expected_output = "0 example-bucket example-bucket 1"
+    environment = {
+        **os.environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+    }
+
+    # When
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+
+    # Then
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected_output
+
+
 def test_install_patches_hub_in_fresh_process() -> None:
     # Given
     script = """

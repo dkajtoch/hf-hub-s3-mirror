@@ -67,7 +67,9 @@ path = hf_hub_download(
 
 Importing the package does not activate the mirror; only `install` does.
 `bucket` and `prefix` default to `HF_S3_MIRROR_BUCKET` and
-`HF_S3_MIRROR_PREFIX` when omitted.
+`HF_S3_MIRROR_PREFIX` when omitted. `bucket` may also be a function returning
+the name; it is called on the first S3 access, so `install` can run before
+the process knows, for example, its AWS region.
 
 By default installation disables public-Hub fallback: an absent mirrored
 repository, revision, or file fails instead of fetching it from the internet.

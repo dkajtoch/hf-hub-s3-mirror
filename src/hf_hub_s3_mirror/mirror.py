@@ -16,10 +16,10 @@ import re
 import shutil
 import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from pathlib import Path, PurePosixPath
 from types import ModuleType
 from typing import Any, BinaryIO, Literal, TypedDict, cast
@@ -189,12 +189,18 @@ def _validate_manifest(
     return cast(Manifest, value)
 
 
+def _validate_bucket(bucket: str | None) -> str:
+    if not bucket or "://" in bucket or "/" in bucket:
+        raise ValueError("A valid S3 bucket is required for the mirror")
+    return bucket
+
+
 class _S3Repository:
-    def __init__(self, bucket: str, prefix: str) -> None:
+    def __init__(self, bucket: str | Callable[[], str], prefix: str) -> None:
         import boto3
         from boto3.s3.transfer import TransferConfig
 
-        self.bucket = bucket
+        self.bucket_source = bucket
         self.prefix = prefix.strip("/")
         self.s3 = boto3.client("s3", endpoint_url=os.environ.get("HF_S3_ENDPOINT_URL"))
         self.transfer_config = TransferConfig(
@@ -209,6 +215,11 @@ class _S3Repository:
             use_threads=True,
             preferred_transfer_client=os.environ.get("HF_S3_TRANSFER_CLIENT", "auto"),
         )
+
+    @cached_property
+    def bucket(self) -> str:
+        source = self.bucket_source
+        return _validate_bucket(source() if callable(source) else source)
 
     def key(self, *parts: str) -> str:
         return "/".join(part for part in (self.prefix, *parts) if part)
@@ -1031,13 +1042,14 @@ def _install_api_helpers(hub_module: ModuleType, api_module: ModuleType) -> None
 
 def install(
     *,
-    bucket: str | None = None,
+    bucket: str | Callable[[], str] | None = None,
     prefix: str | None = None,
     allow_hub_fallback: bool | None = None,
 ) -> None:
     """Install the mirror for this process before importing Hub consumers.
 
     The S3 bucket must be supplied explicitly or by ``HF_S3_MIRROR_BUCKET``.
+    A callable bucket is resolved on first S3 access instead of at install.
     Installation is process-wide and fails closed to the public Hub unless
     ``allow_hub_fallback`` (or ``HF_S3_MIRROR_ALLOW_HUB_FALLBACK``) is set, in
     which case repositories absent from the mirror are read from the Hub.
@@ -1052,17 +1064,19 @@ def install(
         if allow_hub_fallback != _HUB_FALLBACK:
             raise RuntimeError("S3 mirror is already installed with different settings")
         return
-    resolved_bucket = bucket or os.environ.get("HF_S3_MIRROR_BUCKET")
+    resolved_bucket: str | Callable[[], str] | None = bucket or os.environ.get(
+        "HF_S3_MIRROR_BUCKET"
+    )
     resolved_prefix = prefix or os.environ.get(
         "HF_S3_MIRROR_PREFIX", _DEFAULT_MIRROR_PREFIX
     )
-    if not resolved_bucket or "://" in resolved_bucket or "/" in resolved_bucket:
-        raise ValueError("A valid S3 bucket is required for the mirror")
+    if not callable(resolved_bucket):
+        resolved_bucket = _validate_bucket(resolved_bucket)
     if not resolved_prefix.strip("/"):
         raise ValueError("The mirror prefix must not be empty")
     if _INSTALLED:
         assert _BACKEND is not None
-        if (_BACKEND.bucket, _BACKEND.prefix, _HUB_FALLBACK) != (
+        if (_BACKEND.bucket_source, _BACKEND.prefix, _HUB_FALLBACK) != (
             resolved_bucket,
             resolved_prefix.strip("/"),
             allow_hub_fallback,

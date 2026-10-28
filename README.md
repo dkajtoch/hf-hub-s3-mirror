@@ -103,5 +103,5 @@ Before the first release, configure the PyPI project's trusted publisher with
 owner `dkajtoch`, repository `hf-hub-s3-mirror`, workflow `release.yaml`, and
 GitHub environment `pypi`. Configure that environment to require approval.
 Then tag a commit on `main` matching the version in `pyproject.toml` (for
-example, `v0.1.0`). The workflow rejects tags whose version differs or whose
+example, `v0.1.0a1`). The workflow rejects tags whose version differs or whose
 commit is not on `main`. Creating the workflow alone does not publish anything.

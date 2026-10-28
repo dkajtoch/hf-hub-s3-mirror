@@ -65,10 +65,9 @@ path = hf_hub_download(
 )
 ```
 
-For an entrypoint that cannot call `install` before those imports, import the
-package at process startup with `HF_S3_MIRROR_ENABLED=1` and set
-`HF_S3_MIRROR_BUCKET` (and optionally `HF_S3_MIRROR_PREFIX`) first. Importing
-the package alone does not activate the mirror unless that flag is set.
+Importing the package does not activate the mirror; only `install` does.
+`bucket` and `prefix` default to `HF_S3_MIRROR_BUCKET` and
+`HF_S3_MIRROR_PREFIX` when omitted.
 
 By default installation disables public-Hub fallback: an absent mirrored
 repository, revision, or file fails instead of fetching it from the internet.

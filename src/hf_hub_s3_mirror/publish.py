@@ -201,11 +201,6 @@ def select_files(
 
 
 def publish(args: argparse.Namespace) -> dict:
-    if os.environ.get("HF_S3_MIRROR_ENABLED", "").lower() in {"1", "true", "yes", "on"}:
-        raise RuntimeError(
-            "Disable HF_S3_MIRROR_ENABLED when publishing from the upstream Hugging Face Hub"
-        )
-
     expected_type = _KIND_REPO_TYPES[args.kind]
     path = args.hf_path.removeprefix("hf://")
     if (path.startswith("datasets/") and expected_type != "dataset") or (

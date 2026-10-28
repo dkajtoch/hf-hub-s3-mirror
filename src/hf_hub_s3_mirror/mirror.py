@@ -1115,7 +1115,3 @@ def install(
     setattr(huggingface_hub._snapshot_download, "snapshot_download", snapshot_download)
     sys.meta_path.insert(0, _DatasetsConfigFinder())
     _INSTALLED = True
-
-
-if os.environ.get("HF_S3_MIRROR_ENABLED", "").lower() in _TRUE_VALUES:
-    install()

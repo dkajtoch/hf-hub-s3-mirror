@@ -199,7 +199,6 @@ print(mirror._HUB_FALLBACK, os.environ.get('HF_ENDPOINT'))
     }
     environment.update(
         PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"),
-        HF_S3_MIRROR_ENABLED="0",
         HF_S3_MIRROR_ALLOW_HUB_FALLBACK="1",
     )
 
@@ -358,10 +357,7 @@ def test_filesystem_ls_raises_for_a_missing_path(
 def test_import_is_inert_until_explicit_install() -> None:
     # Given
     script = (
-        "import os, sys; "
-        "os.environ.pop('HF_S3_MIRROR_ENABLED', None); "
-        "import hf_hub_s3_mirror; "
-        "print('huggingface_hub' in sys.modules)"
+        "import sys; import hf_hub_s3_mirror; print('huggingface_hub' in sys.modules)"
     )
     expected_output = "False"
     environment = {
@@ -398,7 +394,6 @@ print(HfApi is S3HfApi)
     environment = {
         **os.environ,
         "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
-        "HF_S3_MIRROR_ENABLED": "0",
     }
 
     # When
@@ -436,7 +431,6 @@ print(all(
     environment = {
         **os.environ,
         "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
-        "HF_S3_MIRROR_ENABLED": "0",
     }
 
     # When

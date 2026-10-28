@@ -72,7 +72,6 @@ def fake_hub(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(publish, "HfApi", FakeHfApi)
     monkeypatch.setattr(publish, "hf_hub_download", download)
     monkeypatch.setattr(publish.boto3, "client", lambda *args, **kwargs: s3)
-    monkeypatch.delenv("HF_S3_MIRROR_ENABLED", raising=False)
 
     def run(*argv: str) -> dict:
         return publish.publish(

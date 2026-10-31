@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hf-hub-s3-mirror"
-version = "0.1.0a5"
+version = "0.1.0a6"
 description = "S3-backed access to mirrored Hugging Face Hub repositories"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"

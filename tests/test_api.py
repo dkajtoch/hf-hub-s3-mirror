@@ -337,6 +337,164 @@ def test_absent_repo_api_and_safe_identity_helper_keep_hub_behavior(
     assert HubApi.calls == expected_hub_calls
 
 
+@pytest.mark.parametrize("local_files_only", [False, True], ids=["online", "offline"])
+@pytest.mark.parametrize(
+    ("method", "arguments", "upstream_download", "expected_result"),
+    [
+        pytest.param(
+            "snapshot_download",
+            ("other/model",),
+            "huggingface_hub._snapshot_download.snapshot_download",
+            "hub snapshot",
+            id="snapshot",
+        ),
+        pytest.param(
+            "hf_hub_download",
+            ("other/model", "config.json"),
+            "huggingface_hub.file_download.hf_hub_download",
+            "hub file",
+            id="file",
+        ),
+    ],
+)
+def test_download_for_unmirrored_repo_uses_hub_instance_defaults_and_overrides(
+    configured_fallback: FallbackRepository,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    method: str,
+    arguments: tuple[str, ...],
+    upstream_download: str,
+    expected_result: str,
+    local_files_only: bool,
+) -> None:
+    # Given
+    download_calls: list[dict[str, Any]] = []
+    expected_client_settings: dict[str, Any] = {
+        "endpoint": "https://private-hub.example",
+        "token": "default-token",
+        "library_name": "mirror-client",
+        "library_version": "1.0",
+        "user_agent": {"component": "test"},
+        "headers": {"X-Test": "default"},
+    }
+    expected_forwarded_settings = {
+        name: value
+        for name, value in expected_client_settings.items()
+        if name != "token"
+    }
+
+    def record_download(**kwargs: Any) -> str:
+        download_calls.append(kwargs)
+        return expected_result
+
+    monkeypatch.setitem(mirror._UPSTREAM, "HfApi", UpstreamHfApi)
+    monkeypatch.setattr(upstream_download, record_download)
+    api = mirror.S3HfApi(**expected_client_settings)
+    expected_tokens = [
+        expected_client_settings["token"],
+        expected_client_settings["token"],
+        False,
+        "per-call-token",
+    ]
+    expected_results = [expected_result] * len(expected_tokens)
+
+    # When
+    results = [
+        getattr(api, method)(
+            *arguments,
+            revision="main",
+            cache_dir=tmp_path / "default-cache",
+            local_files_only=local_files_only,
+        ),
+        getattr(api, method)(
+            *arguments,
+            revision="none",
+            cache_dir=tmp_path / "none-cache",
+            token=None,
+            local_files_only=local_files_only,
+        ),
+        getattr(api, method)(
+            *arguments,
+            revision="false",
+            cache_dir=tmp_path / "false-cache",
+            token=False,
+            local_files_only=local_files_only,
+        ),
+        getattr(api, method)(
+            *arguments,
+            revision="override",
+            cache_dir=tmp_path / "override-cache",
+            token="per-call-token",
+            force_download=True,
+            local_files_only=local_files_only,
+        ),
+    ]
+
+    # Then
+    assert results == expected_results
+    assert [call["token"] for call in download_calls] == expected_tokens
+    for call in download_calls:
+        for name, expected_value in expected_forwarded_settings.items():
+            assert call[name] == expected_value
+
+
+def test_snapshot_download_for_mirrored_repo_stays_on_s3(
+    configured_fallback: FallbackRepository,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Given
+    hub_snapshot_calls: list[dict[str, Any]] = []
+
+    class HubApi:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            hub_snapshot_calls.append({"init": kwargs})
+
+        def snapshot_download(self, **kwargs: Any) -> str:
+            hub_snapshot_calls.append(kwargs)
+            return "hub snapshot"
+
+    monkeypatch.setitem(mirror._UPSTREAM, "HfApi", HubApi)
+    api = mirror.S3HfApi(endpoint="https://private-hub.example", token="token")
+    expected_payload = configured_fallback.payload
+    expected_hub_snapshot_calls: list[dict[str, Any]] = []
+
+    # When
+    snapshot = Path(
+        api.snapshot_download(
+            "example/model", cache_dir=tmp_path / "mirror-cache", max_workers=1
+        )
+    )
+
+    # Then
+    assert (snapshot / "config.json").read_bytes() == expected_payload
+    assert hub_snapshot_calls == expected_hub_snapshot_calls
+
+
+@pytest.mark.parametrize(
+    ("method", "arguments"),
+    [
+        pytest.param("hf_hub_download", ("other/model", "config.json"), id="file"),
+        pytest.param("snapshot_download", ("other/model",), id="snapshot"),
+    ],
+)
+def test_download_local_files_only_for_unmirrored_repo_uses_no_s3_or_http(
+    offline_fallback: list[str],
+    method: str,
+    arguments: tuple[str, ...],
+) -> None:
+    # Given
+    api = mirror.S3HfApi(endpoint="https://private-hub.example", token="token")
+    expected_network_calls: list[str] = []
+
+    # When
+    with pytest.raises(errors.LocalEntryNotFoundError):
+        getattr(api, method)(*arguments, local_files_only=True)
+
+    # Then
+    assert offline_fallback == expected_network_calls
+
+
 def test_api_routes_repositories_absent_from_mirror_to_hub(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

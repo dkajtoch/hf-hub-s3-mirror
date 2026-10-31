@@ -20,8 +20,30 @@ from _support import (
     _forbidden,
     _recording_hub_api,
 )
+from huggingface_hub import constants
+from huggingface_hub._snapshot_download import snapshot_download as upstream_snapshot
+from huggingface_hub.file_download import hf_hub_download as upstream_download
+from huggingface_hub.hf_api import HfApi as UpstreamHfApi
 
 from hf_hub_s3_mirror import mirror, publish
+
+
+@pytest.fixture
+def offline_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[str]:
+    # Given
+    network_calls: list[str] = []
+    monkeypatch.setattr(mirror, "_BACKEND", None)
+    monkeypatch.setattr(mirror, "_HUB_FALLBACK", True)
+    monkeypatch.setitem(mirror._UPSTREAM, "HfApi", UpstreamHfApi)
+    monkeypatch.setitem(mirror._UPSTREAM, "hf_hub_download", upstream_download)
+    monkeypatch.setitem(mirror._UPSTREAM, "snapshot_download", upstream_snapshot)
+    cache_dir = str(tmp_path / "hub-cache")
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", cache_dir)
+    monkeypatch.setattr(constants, "HF_HUB_DISABLE_TELEMETRY", True)
+    monkeypatch.setenv("HF_HUB_CACHE", cache_dir)
+    for target in NETWORK_ENTRY_POINTS:
+        monkeypatch.setattr(target, _forbidden(target, network_calls))
+    return network_calls
 
 
 @pytest.fixture

@@ -6,6 +6,7 @@ import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Thread
 from typing import Any
 
 import pytest
@@ -25,6 +26,7 @@ from _support import (
     Observed,
     SnapshotRepository,
 )
+from fsspec.implementations.local import LocalFileSystem
 from fsspec.utils import tokenize
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 
@@ -112,7 +114,7 @@ READ_OPERATIONS = [
     Operation(
         "expand_path",
         lambda fs, _: fs.expand_path(MODEL_ID, recursive=True),
-        [MODEL_ID, IMMUTABLE_FILE],
+        [f"{MODEL_ID}@{COMMIT}", IMMUTABLE_FILE],
     ),
     Operation("find", lambda fs, _: fs.find(MODEL_ID), [IMMUTABLE_FILE]),
     Operation("get", _downloaded_with("get"), PAYLOAD),
@@ -468,6 +470,109 @@ class FilesystemRepository:
         return {"files": self.files}
 
 
+def test_recursive_glob_scans_a_wide_manifest_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given
+    class CountingFiles(dict):
+        scans = 0
+
+        def items(self):
+            self.scans += 1
+            return super().items()
+
+    files = CountingFiles(
+        {
+            f"directory-{index:04}/data.txt": {"blob_sha256": "a" * 64, "size": 1}
+            for index in range(5_000)
+        }
+    )
+    monkeypatch.setattr(mirror, "_BACKEND", FilesystemRepository(COMMIT, files))
+    monkeypatch.setattr(mirror, "_HUB_FALLBACK", False)
+    filesystem = mirror._filesystem_class()()
+    root = f"example/model@{COMMIT}"
+    expected_matches = {
+        f"{root}/directory-{index:04}/data.txt": {
+            "name": f"{root}/directory-{index:04}/data.txt",
+            "size": 1,
+            "type": "file",
+        }
+        for index in range(5_000)
+    }
+    expected_manifest_scans = 1
+
+    # When
+    matches = filesystem.glob("example/model/**/*.txt", detail=True)
+
+    # Then
+    assert matches == expected_matches
+    assert files.scans == expected_manifest_scans
+
+
+@pytest.mark.parametrize(
+    ("pattern", "maxdepth", "withdirs"),
+    [
+        ("**", None, True),
+        ("**", 1, True),
+        ("**", None, False),
+        ("**/*.txt", 2, False),
+        ("data/**", None, True),
+        ("data/**/other.txt", 1, True),
+        ("data/*/", None, True),
+        ("data/?art.txt", None, True),
+        ("*/[a-z]*.txt", None, False),
+        ("data", None, False),
+        ("config.json", None, True),
+        ("missing/**", None, True),
+        ("", None, True),
+    ],
+)
+def test_manifest_glob_preserves_fsspec_matching_and_depth(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pattern: str,
+    maxdepth: int | None,
+    withdirs: bool,
+) -> None:
+    # Given
+    repository = SnapshotRepository()
+    repository.files["data/nested/other.txt"] = b"nested"
+    monkeypatch.setattr(mirror, "_BACKEND", repository)
+    monkeypatch.setattr(mirror, "_HUB_FALLBACK", False)
+    filesystem = mirror._filesystem_class()()
+    reference_root = tmp_path / "reference"
+    for filename, payload in repository.files.items():
+        reference_file = reference_root / filename
+        reference_file.parent.mkdir(parents=True, exist_ok=True)
+        reference_file.write_bytes(payload)
+    root = f"example/model@{repository.commit}"
+    reference_matches = LocalFileSystem().glob(
+        f"{reference_root}/{pattern}",
+        maxdepth=maxdepth,
+        withdirs=withdirs,
+        detail=True,
+    )
+    expected_matches = {
+        name.replace(str(reference_root), root, 1): {
+            "name": name.replace(str(reference_root), root, 1),
+            "type": info["type"],
+            "size": info["size"] if info["type"] == "file" else 0,
+        }
+        for name, info in reference_matches.items()
+    }
+
+    # When
+    matches = filesystem.glob(
+        f"example/model/{pattern}",
+        maxdepth=maxdepth,
+        withdirs=withdirs,
+        detail=True,
+    )
+
+    # Then
+    assert matches == expected_matches
+
+
 def test_filesystem_glob_does_not_match_nested_files_for_single_star(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -571,6 +676,215 @@ def test_filesystem_glob_honors_recursive_depth(
 
     # Then
     assert matches == expected_matches
+
+
+def test_filesystem_constructs_in_a_second_thread_without_hub(
+    monkeypatch: pytest.MonkeyPatch, observed: Observed
+) -> None:
+    # Given
+    monkeypatch.setattr(mirror, "_HUB_FALLBACK", False)
+    filesystem_class = mirror._filesystem_class()
+    filesystem_class.clear_instance_cache()
+    main_thread_filesystem = filesystem_class()
+    thread_results: list[Any] = []
+    thread_errors: list[Exception] = []
+    expected_thread_count = 1
+    expected_thread_errors: list[Exception] = []
+    expected_cache: dict[Any, Any] = {}
+    expected_hub_calls: list[str] = []
+    expected_network_calls: list[str] = []
+
+    def construct_filesystem() -> None:
+        try:
+            thread_results.append(filesystem_class())
+        except Exception as error:
+            thread_errors.append(error)
+
+    worker = Thread(target=construct_filesystem)
+
+    # When
+    worker.start()
+    worker.join()
+
+    # Then
+    assert thread_errors == expected_thread_errors
+    assert len(thread_results) == expected_thread_count
+    assert main_thread_filesystem._repo_and_revision_exists_cache == expected_cache
+    assert main_thread_filesystem._bucket_exists_cache == expected_cache
+    assert thread_results[0]._repo_and_revision_exists_cache == expected_cache
+    assert thread_results[0]._bucket_exists_cache == expected_cache
+    assert observed.hub_calls == expected_hub_calls
+    assert observed.network_calls == expected_network_calls
+
+
+@pytest.mark.parametrize(
+    ("path", "revision"),
+    [
+        pytest.param("example/model", None, id="unpinned"),
+        pytest.param("example/model@main", None, id="symbolic"),
+        pytest.param("example/model@feature%2Ffoo", None, id="encoded-slash"),
+        pytest.param("example/model", "feature/foo", id="revision-argument"),
+    ],
+)
+@pytest.mark.parametrize("detail", [False, True])
+def test_filesystem_find_pins_recursive_entries_to_one_commit(
+    monkeypatch: pytest.MonkeyPatch, path: str, revision: str | None, detail: bool
+) -> None:
+    # Given
+    repository = SnapshotRepository()
+    repository.files["data/nested/other.txt"] = b"nested"
+    monkeypatch.setattr(mirror, "_BACKEND", repository)
+    monkeypatch.setattr(mirror, "_HUB_FALLBACK", False)
+    filesystem = mirror._filesystem_class()()
+    root = f"example/model@{repository.commit}"
+    expected_paths = [
+        root,
+        f"{root}/config.json",
+        f"{root}/data",
+        f"{root}/data/nested",
+        f"{root}/data/nested/other.txt",
+        f"{root}/data/part.txt",
+    ]
+    expected = (
+        {
+            root: {"name": root, "size": 0, "type": "directory"},
+            f"{root}/config.json": {
+                "name": f"{root}/config.json",
+                "size": 2,
+                "type": "file",
+            },
+            f"{root}/data": {
+                "name": f"{root}/data",
+                "size": 0,
+                "type": "directory",
+            },
+            f"{root}/data/nested": {
+                "name": f"{root}/data/nested",
+                "size": 0,
+                "type": "directory",
+            },
+            f"{root}/data/nested/other.txt": {
+                "name": f"{root}/data/nested/other.txt",
+                "size": 6,
+                "type": "file",
+            },
+            f"{root}/data/part.txt": {
+                "name": f"{root}/data/part.txt",
+                "size": 7,
+                "type": "file",
+            },
+        }
+        if detail
+        else expected_paths
+    )
+
+    # When
+    actual = filesystem.find(path, withdirs=True, detail=detail, revision=revision)
+
+    # Then
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("source", "revision"),
+    [
+        pytest.param("example/model", None, id="unpinned"),
+        pytest.param("example/model@main", None, id="symbolic"),
+        pytest.param("example/model@feature%2Ffoo", None, id="encoded-slash"),
+        pytest.param("example/model", "feature/foo", id="revision-argument"),
+    ],
+)
+def test_filesystem_recursive_get_uses_one_commit_pinned_destination_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source: str,
+    revision: str | None,
+) -> None:
+    # Given
+    repository = SnapshotRepository()
+    repository.files["data/nested/other.txt"] = b"nested"
+    monkeypatch.setattr(mirror, "_BACKEND", repository)
+    monkeypatch.setattr(mirror, "_HUB_FALLBACK", False)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub-cache"))
+    filesystem = mirror._filesystem_class()()
+    destination = tmp_path / "download"
+    expected_paths = [
+        "config.json",
+        "data",
+        "data/nested",
+        "data/nested/other.txt",
+        "data/part.txt",
+    ]
+
+    # When
+    filesystem.get(source, str(destination), recursive=True, revision=revision)
+    actual_paths = sorted(
+        item.relative_to(destination).as_posix() for item in destination.rglob("*")
+    )
+
+    # Then
+    assert actual_paths == expected_paths
+
+
+def test_filesystem_recursive_get_preserves_a_trailing_source_slash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Given
+    repository = SnapshotRepository()
+    repository.files["data/nested/other.txt"] = b"nested"
+    monkeypatch.setattr(mirror, "_BACKEND", repository)
+    monkeypatch.setattr(mirror, "_HUB_FALLBACK", False)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub-cache"))
+    filesystem = mirror._filesystem_class()()
+    source = "example/model@feature%2Ffoo/"
+    destination = tmp_path / "download"
+    destination.mkdir()
+    expected_paths = [
+        "config.json",
+        "data",
+        "data/nested",
+        "data/nested/other.txt",
+        "data/part.txt",
+    ]
+    expected_payloads = {
+        "config.json": b"{}",
+        "data/nested/other.txt": b"nested",
+        "data/part.txt": b"payload",
+    }
+
+    # When
+    filesystem.get(source, str(destination), True)
+    actual_paths = sorted(
+        item.relative_to(destination).as_posix() for item in destination.rglob("*")
+    )
+    actual_payloads = {
+        path: (destination / path).read_bytes() for path in expected_payloads
+    }
+
+    # Then
+    assert actual_paths == expected_paths
+    assert actual_payloads == expected_payloads
+
+
+def test_filesystem_get_normalizes_a_list_with_a_revision_argument(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Given
+    repository = SnapshotRepository()
+    monkeypatch.setattr(mirror, "_BACKEND", repository)
+    monkeypatch.setattr(mirror, "_HUB_FALLBACK", False)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub-cache"))
+    filesystem = mirror._filesystem_class()()
+    source = ["example/model/config.json"]
+    destination = tmp_path / "downloaded.json"
+    expected_payload = b"{}"
+
+    # When
+    filesystem.get(source, [str(destination)], revision="feature/foo")
+    actual_payload = destination.read_bytes()
+
+    # Then
+    assert actual_payload == expected_payload
 
 
 def _filesystem(

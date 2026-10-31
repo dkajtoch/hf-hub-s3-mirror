@@ -69,14 +69,19 @@ def _repo() -> _S3Repository:
     return _BACKEND
 
 
-def _use_hub(repo_type: str | None, repo_id: str) -> bool:
+def _use_hub(
+    repo_type: str | None, repo_id: str, *, local_files_only: bool = False
+) -> bool:
     """Route a repository absent from the mirror to the Hub when fallback is on.
 
-    A mirrored repository is never mixed with Hub reads: its manifest stays
+    Online, a mirrored repository is never mixed with Hub reads: its manifest stays
     authoritative, so missing revisions or files still fail closed.
+    Offline fallback uses the Hub's local resolver without querying S3.
     """
     if not _HUB_FALLBACK:
         return False
+    if local_files_only:
+        return True
     try:
         validated_repo_type = _validate_repo_type(repo_type)
         _validate_repo_id(repo_id)
@@ -98,7 +103,7 @@ def hf_hub_download(
     local_files_only: bool = False,
     **kwargs: Any,
 ) -> str:
-    if not local_files_only and _use_hub(repo_type, repo_id):
+    if _use_hub(repo_type, repo_id, local_files_only=local_files_only):
         return _UPSTREAM["hf_hub_download"](
             repo_id,
             filename,
@@ -117,6 +122,15 @@ def hf_hub_download(
     revision = revision or _DEFAULT_REVISION
     filename = f"{subfolder.rstrip('/')}/{filename}" if subfolder else filename
     _validate_repo_path(filename)
+    if local_files_only and force_download:
+        raise ValueError(
+            "Cannot pass 'force_download=True' and 'local_files_only=True' at the same time."
+        )
+    if local_files_only and local_dir is not None:
+        local_dir = Path(local_dir).expanduser().resolve()
+        local_file = local_dir / filename
+        if local_file.is_file():
+            return str(local_file)
     layout = _cache_layout(cache_dir, validated_repo_type, repo_id)
     if local_files_only:
         commit = _cached_commit(layout, repo_id, revision)
@@ -195,7 +209,7 @@ def snapshot_download(
     force_download: bool = False,
     **kwargs: Any,
 ) -> str:
-    if not local_files_only and _use_hub(repo_type, repo_id):
+    if _use_hub(repo_type, repo_id, local_files_only=local_files_only):
         return _UPSTREAM["snapshot_download"](
             repo_id,
             repo_type=repo_type,
@@ -421,10 +435,22 @@ class S3HfApi:
             return False
         return True
 
+    @staticmethod
+    def _downloads_from_hub(repo_id: str, kwargs: Mapping[str, Any]) -> bool:
+        return _use_hub(
+            kwargs.get("repo_type"),
+            repo_id,
+            local_files_only=kwargs.get("local_files_only", False),
+        )
+
     def hf_hub_download(self, repo_id: str, filename: str, **kwargs: Any) -> str:
+        if self._downloads_from_hub(repo_id, kwargs):
+            return self._hub().hf_hub_download(repo_id, filename, **kwargs)
         return hf_hub_download(repo_id, filename, **kwargs)
 
     def snapshot_download(self, repo_id: str, **kwargs: Any) -> str:
+        if self._downloads_from_hub(repo_id, kwargs):
+            return self._hub().snapshot_download(repo_id, **kwargs)
         return snapshot_download(repo_id, **kwargs)
 
     def __getattr__(self, name: str):
@@ -535,6 +561,8 @@ def install(
             + ", ".join(already_loaded)
         )
     _BACKEND = _S3Repository(resolved_bucket, resolved_prefix)
+    # Hub agent detection otherwise fetches a registry even for cache-only reads.
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
     if not allow_hub_fallback:
         # A call path that escapes our monkeypatches (or a child process) must fail
         # on an unresolvable HTTPS host and never carry the implicit Hub token.

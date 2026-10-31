@@ -356,6 +356,270 @@ def test_hub_download_falls_back_only_for_repositories_absent_from_mirror(
         assert Path(path).read_bytes() == payload
 
 
+@pytest.mark.parametrize("repo_id", ["gpt2", "other/model"])
+@pytest.mark.parametrize("storage", ["cache", "local_dir"])
+@pytest.mark.parametrize("download", ["hf_hub_download", "snapshot_download"])
+def test_offline_fallback_uses_upstream_cache_and_local_directory(
+    offline_fallback: list[str],
+    tmp_path: Path,
+    repo_id: str,
+    storage: str,
+    download: str,
+) -> None:
+    # Given
+    cache_dir = tmp_path / "cache"
+    local_dir = tmp_path / "local" if storage == "local_dir" else None
+    repo_root = cache_dir / f"models--{repo_id.replace('/', '--')}"
+    if local_dir is None:
+        (repo_root / "refs").mkdir(parents=True)
+        (repo_root / "refs" / "main").write_text(COMMIT)
+        snapshot = repo_root / "snapshots" / COMMIT
+    else:
+        snapshot = local_dir
+    snapshot.mkdir(parents=True)
+    expected_payload = b"offline Hub data"
+    local_file = snapshot / "config.json"
+    local_file.write_bytes(expected_payload)
+    arguments = (
+        (repo_id, "config.json") if download == "hf_hub_download" else (repo_id,)
+    )
+    expected_path = str(local_file if download == "hf_hub_download" else snapshot)
+    expected_network_calls: list[str] = []
+
+    # When
+    actual_path = getattr(mirror, download)(
+        *arguments,
+        cache_dir=cache_dir,
+        local_dir=local_dir,
+        local_files_only=True,
+        token=False,
+    )
+
+    # Then
+    assert actual_path == expected_path
+    assert local_file.read_bytes() == expected_payload
+    assert offline_fallback == expected_network_calls
+
+
+@pytest.mark.parametrize("storage", ["cache", "local_dir"])
+def test_offline_fallback_preserves_upstream_snapshot_completeness_checks(
+    offline_fallback: list[str], tmp_path: Path, storage: str
+) -> None:
+    # Given
+    cache_dir = tmp_path / "cache"
+    repo_root = cache_dir / "models--gpt2"
+    local_dir = tmp_path / "local" if storage == "local_dir" else None
+    snapshot = local_dir if local_dir is not None else repo_root / "snapshots" / COMMIT
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_bytes(b"{}")
+    tree_cache = local_dir / ".cache" / "huggingface" if local_dir else repo_root
+    tree_dir = tree_cache / "trees"
+    tree_dir.mkdir(parents=True)
+    (tree_dir / f"{COMMIT}.json").write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "files": {
+                    "config.json": {"size": 2, "blob_id": "a" * 40},
+                    "missing.json": {"size": 2, "blob_id": "b" * 40},
+                },
+            }
+        )
+    )
+    expected_snapshot_path = str(snapshot)
+    expected_network_calls: list[str] = []
+
+    # When
+    with pytest.raises(errors.IncompleteSnapshotError) as raised:
+        mirror.snapshot_download(
+            "gpt2",
+            revision=COMMIT,
+            cache_dir=cache_dir,
+            local_dir=local_dir,
+            local_files_only=True,
+        )
+
+    # Then
+    assert raised.value.snapshot_path == expected_snapshot_path
+    assert offline_fallback == expected_network_calls
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("uses_tilde", [False, True], ids=["canonical", "tilde"])
+def test_local_only_reuses_an_existing_nested_local_file(
+    offline_fallback: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    uses_tilde: bool,
+    fallback: bool,
+) -> None:
+    # Given
+    cache_dir = tmp_path / "cache"
+    canonical_local_dir = (
+        tmp_path / "home" / "local" if uses_tilde else tmp_path / "local"
+    )
+    local_dir = Path("~/local") if uses_tilde else canonical_local_dir
+    local_file = canonical_local_dir / "nested" / "config.json"
+    local_file.parent.mkdir(parents=True)
+    local_file.write_bytes(b"downloaded through the Hub fallback")
+
+    if uses_tilde:
+        original_expanduser = Path.expanduser
+        monkeypatch.setattr(
+            Path,
+            "expanduser",
+            lambda path: (
+                canonical_local_dir if path == local_dir else original_expanduser(path)
+            ),
+        )
+
+    monkeypatch.setattr(mirror, "_HUB_FALLBACK", fallback)
+    expected_path = str(local_file.absolute())
+    expected_network_calls: list[str] = []
+
+    # When
+    actual_path = mirror.hf_hub_download(
+        "other/model",
+        "config.json",
+        subfolder="nested",
+        revision="main",
+        cache_dir=cache_dir,
+        local_dir=local_dir,
+        local_files_only=True,
+    )
+
+    # Then
+    assert actual_path == expected_path
+    assert offline_fallback == expected_network_calls
+    assert not cache_dir.exists()
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_local_only_rejects_force_download_for_an_existing_local_file(
+    offline_fallback: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fallback: bool,
+) -> None:
+    # Given
+    local_dir = tmp_path / "local"
+    local_file = local_dir / "config.json"
+    local_file.parent.mkdir()
+    expected_payload = b"downloaded through the Hub fallback"
+    local_file.write_bytes(expected_payload)
+    expected_error = "Cannot pass 'force_download=True' and 'local_files_only=True'"
+    monkeypatch.setattr(mirror, "_HUB_FALLBACK", fallback)
+    expected_network_calls: list[str] = []
+
+    # When
+    with pytest.raises(ValueError, match=expected_error):
+        mirror.hf_hub_download(
+            "other/model",
+            "config.json",
+            local_dir=local_dir,
+            local_files_only=True,
+            force_download=True,
+        )
+
+    # Then
+    assert local_file.read_bytes() == expected_payload
+    assert offline_fallback == expected_network_calls
+
+
+@pytest.mark.parametrize("cached", [False, True], ids=["missing", "cached"])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_offline_local_file_miss_uses_the_selected_cache_policy(
+    offline_fallback: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cached: bool,
+    fallback: bool,
+) -> None:
+    # Given
+    cache_dir = tmp_path / "cache"
+    local_dir = tmp_path / "local"
+    commit = "a" * 40
+    expected_payload = b"cached fallback file"
+    expected_local_path = str((local_dir / "nested" / "config.json").absolute())
+    copies_from_mirror_cache = cached and not fallback
+    expected_network_calls: list[str] = []
+    if cached:
+        layout = _cache._cache_layout(cache_dir, "model", "other/model")
+        cached_file = layout.file(commit, "nested/config.json")
+        cached_file.parent.mkdir(parents=True)
+        cached_file.write_bytes(expected_payload)
+        _cache._write_cached_ref(layout, "main", commit)
+    else:
+        cached_file = None
+
+    monkeypatch.setattr(mirror, "_HUB_FALLBACK", fallback)
+
+    # When
+    if copies_from_mirror_cache:
+        actual_path = mirror.hf_hub_download(
+            "other/model",
+            "config.json",
+            subfolder="nested",
+            revision="main",
+            cache_dir=cache_dir,
+            local_dir=local_dir,
+            local_files_only=True,
+        )
+    else:
+        with pytest.raises(errors.LocalEntryNotFoundError):
+            mirror.hf_hub_download(
+                "other/model",
+                "config.json",
+                subfolder="nested",
+                revision="main",
+                cache_dir=cache_dir,
+                local_dir=local_dir,
+                local_files_only=True,
+            )
+
+    # Then
+    if copies_from_mirror_cache:
+        assert actual_path == expected_local_path
+        assert Path(actual_path).read_bytes() == expected_payload
+    else:
+        assert not Path(expected_local_path).exists()
+    if cached:
+        assert cached_file is not None
+        assert cached_file.read_bytes() == expected_payload
+    assert offline_fallback == expected_network_calls
+
+
+@pytest.mark.parametrize("filename", ["../config.json", "nested/../config.json"])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_local_only_validates_local_directory_filenames(
+    offline_fallback: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    filename: str,
+    fallback: bool,
+) -> None:
+    # Given
+    local_dir = tmp_path / "local"
+    escaped_file = tmp_path / "config.json"
+    expected_payload = b"must not be returned"
+    escaped_file.write_bytes(expected_payload)
+    monkeypatch.setattr(mirror, "_HUB_FALLBACK", fallback)
+    expected_network_calls: list[str] = []
+
+    # When
+    with pytest.raises(ValueError):
+        mirror.hf_hub_download(
+            "other/model",
+            filename,
+            local_dir=local_dir,
+            local_files_only=True,
+        )
+
+    # Then
+    assert escaped_file.read_bytes() == expected_payload
+    assert offline_fallback == expected_network_calls
+
+
 def test_cached_ref_encodes_traversal_components(
     tmp_path: Path,
 ) -> None:
@@ -638,7 +902,11 @@ def test_snapshot_keeps_the_commit_resolved_before_a_branch_moves(
     "operation", [mirror.hf_hub_download, mirror.snapshot_download]
 )
 def test_local_only_reads_never_contact_s3(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operation, fallback: bool
+    offline_fallback: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation,
+    fallback: bool,
 ) -> None:
     # Given
     repository = SnapshotRepository()
@@ -653,6 +921,7 @@ def test_local_only_reads_never_contact_s3(
         else ("example/model",)
     )
     expected_payload = repository.files["config.json"]
+    expected_network_calls: list[str] = []
     expected_file = (
         tmp_path
         / "models--example--model"
@@ -668,6 +937,7 @@ def test_local_only_reads_never_contact_s3(
     cached_file = result / "config.json" if result.is_dir() else result
     assert cached_file == expected_file
     assert cached_file.read_bytes() == expected_payload
+    assert offline_fallback == expected_network_calls
 
 
 def test_snapshot_honors_force_download(

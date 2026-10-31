@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, cast
 from urllib.parse import unquote
 
+from fsspec.callbacks import DEFAULT_CALLBACK
+
 from hf_hub_s3_mirror._artifacts import (
     RepoType,
     _DEFAULT_REVISION,
@@ -77,6 +79,10 @@ def create_filesystem(
                 OriginalHfFileSystem.__init__(self, *args, **kwargs)
             else:
                 AbstractFileSystem.__init__(self)
+                self._repo_and_revision_exists_cache: dict[
+                    tuple[str, str, str | None], tuple[bool, Exception | None]
+                ] = {}
+                self._bucket_exists_cache: dict[str, tuple[bool, Exception | None]] = {}
             self.block_size = block_size or _RANGE_BLOCK_SIZE
 
         def _on_hub(self, path: str) -> bool:
@@ -110,6 +116,15 @@ def create_filesystem(
                 _hf_base(resolved.repo_type, resolved.repo_id, commit),
                 files,
             )
+
+        def _pinned_path(self, path: str | Path, revision: str | None = None) -> str:
+            raw_path = str(path)
+            resolved, commit = self._resolved(raw_path, revision)
+            base = _hf_base(resolved.repo_type, resolved.repo_id, commit)
+            pinned_path = (
+                f"{base}/{resolved.path_in_repo}" if resolved.path_in_repo else base
+            )
+            return f"{pinned_path}/" if raw_path.endswith("/") else pinned_path
 
         def resolve_path(self, path: str, revision: str | None = None):
             if self._on_hub(path):
@@ -232,14 +247,101 @@ def create_filesystem(
                     revision=revision,
                     **kwargs,
                 )
-            return AbstractFileSystem.find(
-                self,
-                path,
+            del refresh, kwargs
+            if maxdepth is not None and maxdepth < 1:
+                raise ValueError("maxdepth must be at least 1")
+            resolved, _, base, files = self._repository_view(path, revision)
+            root = f"{base}/{resolved.path_in_repo}" if resolved.path_in_repo else base
+            matches: dict[str, dict[str, Any]] = {}
+            if resolved.path_in_repo in files:
+                matches[root] = {
+                    "name": root,
+                    "size": files[resolved.path_in_repo]["size"],
+                    "type": "file",
+                }
+            else:
+                prefix = f"{resolved.path_in_repo}/" if resolved.path_in_repo else ""
+                root_exists = not resolved.path_in_repo
+                for filename, entry in files.items():
+                    if not filename.startswith(prefix):
+                        continue
+                    root_exists = True
+                    parts = filename[len(prefix) :].split("/")
+                    if maxdepth is None or len(parts) <= maxdepth:
+                        name = f"{base}/{filename}"
+                        matches[name] = {
+                            "name": name,
+                            "size": entry["size"],
+                            "type": "file",
+                        }
+                    if withdirs:
+                        directory = root
+                        for component in parts[:-1][:maxdepth]:
+                            directory = f"{directory}/{component}"
+                            matches.setdefault(
+                                directory,
+                                {"name": directory, "size": 0, "type": "directory"},
+                            )
+                if withdirs and root_exists:
+                    matches[root] = {"name": root, "size": 0, "type": "directory"}
+            names = sorted(matches)
+            return {name: matches[name] for name in names} if detail else names
+
+        def expand_path(
+            self,
+            path: Any,
+            recursive: bool = False,
+            maxdepth: int | None = None,
+            assume_literal: bool = False,
+            **kwargs: Any,
+        ) -> list[str]:
+            if (
+                not recursive
+                or not isinstance(path, (str, Path))
+                or self._on_hub(str(path))
+            ):
+                return super().expand_path(
+                    path,
+                    recursive=recursive,
+                    maxdepth=maxdepth,
+                    assume_literal=assume_literal,
+                    **kwargs,
+                )
+            revision = kwargs.pop("revision", None)
+            return super().expand_path(
+                self._pinned_path(path, revision),
+                recursive=recursive,
                 maxdepth=maxdepth,
-                withdirs=withdirs,
-                detail=detail,
-                refresh=refresh,
-                revision=revision,
+                assume_literal=assume_literal,
+                **kwargs,
+            )
+
+        def get(
+            self,
+            rpath: Any,
+            lpath: Any,
+            recursive: bool = False,
+            callback: Any = DEFAULT_CALLBACK,
+            maxdepth: int | None = None,
+            **kwargs: Any,
+        ) -> None:
+            if isinstance(rpath, list) and all(
+                isinstance(path, (str, Path)) and not self._on_hub(str(path))
+                for path in rpath
+            ):
+                revision = kwargs.pop("revision", None)
+                pinned_path: Any = [self._pinned_path(path, revision) for path in rpath]
+            elif isinstance(rpath, (str, Path)) and not self._on_hub(str(rpath)):
+                revision = kwargs.pop("revision", None)
+                pinned_path = self._pinned_path(rpath, revision)
+            else:
+                pinned_path = rpath
+            return super().get(
+                pinned_path,
+                lpath,
+                recursive=recursive,
+                callback=callback,
+                maxdepth=maxdepth,
                 **kwargs,
             )
 
@@ -266,8 +368,6 @@ def create_filesystem(
             **kwargs: Any,
         ) -> None:
             """Copy mirrored files through ``open`` instead of Hub ``http_get``."""
-            from fsspec.callbacks import DEFAULT_CALLBACK
-
             callback = callback or DEFAULT_CALLBACK
             if self._on_hub(rpath):
                 return super().get_file(

@@ -77,6 +77,9 @@ Importing the package does not activate the mirror; only `install` does.
 the name; it is called on the first S3 access, so `install` can run before
 the process knows, for example, its AWS region.
 
+Installation always sets `HF_HUB_DISABLE_TELEMETRY=1` to prevent upstream
+agent-registry lookups during cache-only reads.
+
 By default installation disables public-Hub fallback: an absent mirrored
 repository, revision, or file fails instead of fetching it from the internet.
 It also sets `HF_ENDPOINT=https://hf-mirror.invalid` and
@@ -86,12 +89,15 @@ Hub request that escapes the mirror fails without sending the implicit token.
 URLs from the mirror and skips its download-count request.
 
 To mirror only some repositories, set `HF_S3_MIRROR_ALLOW_HUB_FALLBACK=1` or
-call `install(..., allow_hub_fallback=True)`. Repositories present in the
-mirror are then read only from S3. Supported operations on other repositories
+call `install(..., allow_hub_fallback=True)`. For online downloads, repositories
+present in the mirror are read only from S3. Supported operations on other repositories
 use the Hub (including `HF_ENDPOINT`, tokens, and Xet). The mirror stays
 authoritative for the repositories it holds: a missing revision or file there
 still fails rather than reaching the Hub, so a gated repository is never
 requested upstream once it is mirrored.
+
+With fallback enabled, `local_files_only=True` uses Hugging Face's local cache
+and `local_dir` handling without querying S3 or making HTTP requests.
 
 Unsupported operations on mirrored repositories fail closed, including writes
 and public-Hub URL generation. Account-only helpers such as `whoami` remain

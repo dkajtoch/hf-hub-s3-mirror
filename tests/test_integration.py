@@ -140,6 +140,7 @@ print(json.dumps({
     'reserved_host': (urlsplit(endpoint).hostname or '').endswith('.invalid'),
     'hub_uses_endpoint': constants.ENDPOINT == endpoint,
     'implicit_token_disabled': os.environ.get('HF_HUB_DISABLE_IMPLICIT_TOKEN'),
+    'telemetry_disabled': constants.HF_HUB_DISABLE_TELEMETRY,
     'implicit_authorization': 'authorization' in build_hf_headers(),
     'explicit_authorization': build_hf_headers(token='hf_explicit').get(
         'authorization'
@@ -151,6 +152,7 @@ print(json.dumps({
         "reserved_host": True,
         "hub_uses_endpoint": True,
         "implicit_token_disabled": "1",
+        "telemetry_disabled": True,
         "implicit_authorization": False,
         "explicit_authorization": "Bearer hf_explicit",
     }
@@ -693,6 +695,76 @@ with patch('boto3.client', return_value=Transport()), patch(
     assert json.loads(result.stdout) == expected_output
 
 
+def test_installed_offline_fallback_uses_local_data_without_s3_or_http(
+    tmp_path: Path,
+) -> None:
+    # Given
+    cached_repo = tmp_path / "cache" / "models--gpt2"
+    (cached_repo / "refs").mkdir(parents=True)
+    commit = "a" * 40
+    (cached_repo / "refs" / "main").write_text(commit)
+    cached_snapshot = cached_repo / "snapshots" / commit
+    cached_snapshot.mkdir(parents=True)
+    (cached_snapshot / "config.json").write_text("cached Hub file")
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+    (local_dir / "config.json").write_text("local Hub snapshot")
+    script = """
+import json
+import os
+from pathlib import Path
+from unittest.mock import patch
+
+from hf_hub_s3_mirror import install
+
+network_calls = []
+def forbid_network(*args, **kwargs):
+    network_calls.append('unexpected network request')
+    raise AssertionError('Offline downloads must not use the network')
+
+with (
+    patch('boto3.client', return_value=object()),
+    patch('httpx.Client.send', side_effect=forbid_network),
+    patch('socket.socket.connect', side_effect=forbid_network),
+):
+    install(bucket='example-bucket', allow_hub_fallback=True)
+    from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+    api = HfApi(token=False, endpoint='https://private-hub.example')
+    downloaded = [
+        Path(download('gpt2', 'config.json', local_files_only=True)).read_text()
+        for download in (hf_hub_download, api.hf_hub_download)
+    ]
+    snapshots = [
+        Path(download(
+            'other/model', local_dir=os.environ['LOCAL_DOWNLOAD'], local_files_only=True,
+        )) / 'config.json'
+        for download in (snapshot_download, api.snapshot_download)
+    ]
+    print(json.dumps({
+        'files': downloaded,
+        'snapshots': [path.read_text() for path in snapshots],
+        'network_calls': network_calls,
+    }))
+"""
+    expected_output = {
+        "files": ["cached Hub file", "cached Hub file"],
+        "snapshots": ["local Hub snapshot", "local Hub snapshot"],
+        "network_calls": [],
+    }
+
+    # When
+    result = _run_in_fresh_process(
+        script,
+        tmp_path,
+        LOCAL_DOWNLOAD=str(local_dir),
+        HF_HUB_DISABLE_TELEMETRY="0",
+    )
+
+    # Then
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == expected_output
+
+
 def test_published_model_is_readable_as_a_snapshot_and_offline_file(
     fake_hub, tmp_path: Path
 ) -> None:
@@ -734,15 +806,20 @@ print(json.dumps({
     assert json.loads(result.stdout) == expected_output
 
 
-@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    ("streaming", "shard_count"),
+    [(False, 2), (True, 2), (False, 16)],
+    ids=["eager", "streaming", "threaded-downloads"],
+)
 def test_published_dataset_loads_through_datasets(
-    fake_hub, tmp_path: Path, streaming: bool
+    fake_hub, tmp_path: Path, streaming: bool, shard_count: int
 ) -> None:
     # Given
-    for index, text in enumerate(["hello", "mirror"]):
+    expected_rows = [{"text": f"row {index}"} for index in range(shard_count)]
+    for index, row in enumerate(expected_rows):
         shard = io.BytesIO()
-        pq.write_table(pa.table({"text": [text]}), shard)
-        fake_hub.files[f"data/train-{index}.parquet"] = shard.getvalue()
+        pq.write_table(pa.Table.from_pylist([row]), shard)
+        fake_hub.files[f"data/train-{index:02}.parquet"] = shard.getvalue()
     fake_hub.files[".huggingface.yaml"] = b"""
 configs:
 - config_name: default
@@ -759,7 +836,7 @@ dataset = load_dataset(
 print(json.dumps({{'rows': list(dataset), 'network_calls': network_calls}}))
 """
     expected_output = {
-        "rows": [{"text": "hello"}, {"text": "mirror"}],
+        "rows": expected_rows,
         "network_calls": [],
     }
 
